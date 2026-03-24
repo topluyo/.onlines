@@ -1,180 +1,266 @@
 # !onlines — Online Presence WebSocket Sunucusu
 
-Kullanıcıların hangi gruptaki hangi kanalda olduğunu ve çevrimiçi durumlarını anlık izleyen Go WebSocket sunucusu.
-
-## Özellikler
-
-- **go-memdb** — O(1) lookup, 6 indeksli in-memory veritabanı
-- **sync.Mutex** — Concurrent write koruması
-- **Ping/Pong** — 30 sn keep-alive, 60 sn read deadline
-- **Otomatik temizlik** — `defer` ile bağlantı kapanırken memdb'den silinme
-- **Durum yönetimi** — `online`, `offline`, `idle`, `dnd` + özel durum metni
-- **Güvenlik** — Token/StatusText uzunluk sınırları, parameterized SQL, panic recovery
+Yüksek performanslı Go WebSocket sunucusu: interest-based routing, event batching, partial presence, friend durumları.
 
 ## Çalıştırma
 
 ```bash
-# Production (MySQL gerektirir)
-go run main.go port=8085
-
-# Test modu (MySQL atlanır, auto-increment user ID)
-go run main.go port=8085 env=test
+go run main.go port=8085              # production
+go run main.go port=8085 env=test     # test modu (MySQL bypass)
 ```
 
-### Argümanlar
+---
 
-| Argüman | Varsayılan | Açıklama |
-|---------|-----------|----------|
-| `port`  | `8085`    | HTTP dinleme portu |
-| `env`   | —         | `test` → MySQL bypass, auth otomatik |
+## Client Kullanım Kılavuzu
 
-## WebSocket Protokolü
+### 1. Bağlantı
 
-Endpoint: `/!onlines`
+WebSocket bağlantısı aç:
 
-### Client → Server
+```
+ws://sunucu:8085/!onlines
+```
 
-```jsonc
-// 1. Auth (ilk mesaj, zorunlu)
-{"type": "auth", "token": "abc123"}
+### 2. Auth (zorunlu, ilk mesaj)
 
-// 2. Kanala giriş
+Bağlandıktan sonra **ilk mesaj** olarak token gönder:
+
+```json
+{"type": "auth", "token": "kullanici-session-tokeni"}
+```
+
+Sunucu cevabı:
+
+```json
+{"type": "auth", "success": true, "user_id": 42}
+```
+
+Başarısızsa `success: false` döner ve bağlantı kapanır.
+
+Auth başarılı olunca otomatik olarak arkadaş durumları gelir (sadece durum bilgisi, kanal bilgisi yok):
+
+```json
+{"type": "friends", "friends": {"7": {"s": "online", "t": ""}, "12": {"s": "idle", "t": "brb"}}}
+```
+
+> Sadece sokete bağlı ve offline olmayan arkadaşlar listelenir.
+
+### 3. Kanala Giriş
+
+Bir grubun kanalına girmek için:
+
+```json
 {"type": "join", "group_id": 5, "channel_id": 12}
+```
 
-// 3. Durum güncelleme
+Sunucudan gelen cevaplar:
+
+```json
+// Sana — sadece gruba ilk katılımda gelir (kanal değişikliğinde gelmez)
+{"type": "presence", "group_id": 5, "channels": {"12": [7, 8], "15": [3]}, "statuses": {"7": {"s": "online", "t": ""}}, "has_more": false}
+
+// Aynı gruptaki herkese — senin kanala girdiğini bildirir
+{"type": "channel_join", "user_id": 42, "channel_id": 12, "group_id": 5, "status": "online", "status_text": ""}
+```
+
+> **Not:** `presence` sadece **gruba ilk katılımda** gönderilir. Aynı grup içinde kanal değiştirdiğinde presence tekrar gönderilmez.
+
+> **Not:** `channel_join` ve `channel_leave` event'leri aynı **gruptaki herkese** gider — sadece aynı kanaldakilere değil. Bu sayede herhangi bir kanalda olmayan biri de gruptaki hareketleri görür.
+
+**Kanal değiştirmek:** Yeni bir `join` gönder. Eski kanaldan otomatik çıkış olur ve gruptaki herkese `channel_leave` gider.
+
+**Rate limit:** Join'ler arası minimum 200ms. Daha hızlı göndersen yoksayılır.
+
+### 4. Durum Güncelleme
+
+```json
 {"type": "status", "status": "idle", "status_text": "Birazdan dönerim"}
 ```
 
-### Server → Client
+Geçerli durum değerleri:
 
-```jsonc
-// Auth sonucu
-{"type": "auth", "success": true, "user_id": 42}
+| Değer | Anlam |
+|-------|-------|
+| `online` | Çevrimiçi |
+| `offline` | Çevrimdışı (presence'da gizlenir) |
+| `idle` | Boşta |
+| `dnd` | Rahatsız etmeyin |
 
-// Birisi kanala girdi (gruptaki herkese)
-{"type": "channel_join", "user_id": 7, "channel_id": 12, "group_id": 5, "status": "online", "status_text": ""}
+`status_text` isteğe bağlıdır (boş olabilir, max 128 karakter).
 
-// Birisi kanaldan çıktı (gruptaki herkese)
-{"type": "channel_leave", "user_id": 7, "channel_id": 12, "group_id": 5}
+Durum değişikliği **aynı gruptakilere** ve **arkadaşlarına** bildirilir:
 
-// Presence haritası (join sonrası gönderilir)
-{"type": "presence", "group_id": 5, "channels": {"12": [7,8], "15": [3]}, "statuses": {"7": {"s": "online", "t": ""}, "8": {"s": "idle", "t": "brb"}}}
-
-// Durum değişikliği (gruptaki herkese)
-{"type": "status_change", "user_id": 7, "status": "idle", "status_text": "brb"}
+```json
+{"type": "status_change", "user_id": 42, "status": "idle", "status_text": "Birazdan dönerim"}
 ```
 
-## Akış Senaryoları
+### 5. Bağlantı Kopması
 
-### Kanala Giriş (C kullanıcısı X kanalına girdiğinde)
-1. C'nin memdb kaydı güncellenir (groupID, channelID)
-2. Gruptaki tüm bağlantılara `channel_join` bildirimi gönderilir
-3. C'ye gruptaki tüm kullanıcı konumlarını gösteren `presence` haritası gönderilir
+Bağlantı kapandığında sunucu otomatik olarak:
+- Kullanıcıyı kanaldan çıkarır
+- Aynı kullanıcının o kanalda başka bağlantısı yoksa → **gruptaki herkese** `channel_leave` gönderir
+- Birden fazla bağlantısı varsa (farklı sekmeler/cihazlar) diğer bağlantılar etkilenmez
 
-### Kanaldan Çıkış
-1. Gruptaki tüm bağlantılara `channel_leave` bildirimi gönderilir
-2. memdb kaydı güncellenir
+### 6. Toplu Mesajlar (Batch)
 
-### Kanal Değiştirme
-- Yeni `join` göndermek eski kanaldan otomatik `channel_leave` tetikler
+Sunucu 50ms aralıklarla biriken event'leri toplu gönderebilir:
 
-### Bağlantı Kopması
-- `defer handleDisconnect()` → memdb'den silinme + `channel_leave` bildirimi
+```json
+{"type": "batch", "events": [
+  {"type": "channel_join", "user_id": 7, ...},
+  {"type": "status_change", "user_id": 8, ...}
+]}
+```
 
-### Çevrimdışı Kuralı
-- `status = "offline"` olan kullanıcılar presence haritasında **gösterilmez**
-- İstisna: Çevrimdışı kullanıcı bir kanalda ise sadece o kanalda gösterilir
+Client'ta batch mesajları unpack edip her event'i ayrı işlemelisin.
+
+---
+
+## Sunucudan Gelen Mesaj Tipleri
+
+| type | Ne zaman gelir | Kime gider |
+|------|---------------|-----------|
+| `auth` | Bağlantı anında | Bağlanan kişiye |
+| `friends` | Auth sonrası (otomatik) | Bağlanan kişiye (sadece durum bilgisi) |
+| `presence` | Gruba ilk katılınca | Giren kişiye |
+| `channel_join` | Birisi kanala girince | **Gruptaki herkese** |
+| `channel_leave` | Birisi kanaldan çıkınca | **Gruptaki herkese** |
+| `status_change` | Durum değişince | **Gruptakiler + arkadaşlar** |
+| `batch` | 50ms'de biriken çoklu event | İlgili kişilere |
+
+## Çevrimdışı Kuralı
+
+`status = "offline"` olan kullanıcılar:
+- Presence haritasında **gösterilmez**
+- Arkadaş listesinde **gösterilmez**
+- Ama hâlâ kanaldaysa `channel_leave/join` bildirimleri yine gider
+
+---
+
+## JavaScript Client Örneği
+
+```javascript
+const ws = new WebSocket("ws://localhost:8085/!onlines");
+
+ws.onopen = () => {
+  // 1. Auth
+  ws.send(JSON.stringify({ type: "auth", token: "session-token" }));
+};
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+
+  // Batch mesajları unpack et
+  if (msg.type === "batch") {
+    msg.events.forEach(evt => handleMessage(evt));
+    return;
+  }
+  handleMessage(msg);
+};
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case "auth":
+      if (msg.success) {
+        console.log("Auth OK, userID:", msg.user_id);
+        // 2. Kanala gir
+        ws.send(JSON.stringify({
+          type: "join",
+          group_id: 5,
+          channel_id: 12
+        }));
+      }
+      break;
+
+    case "friends":
+      // Arkadaşların çevrimiçi durumları
+      console.log("Online arkadaşlar:", msg.friends);
+      break;
+
+    case "presence":
+      // Kanaldaki mevcut kullanıcılar
+      console.log("Kanalda:", msg.channels, "Durumlar:", msg.statuses);
+      if (msg.has_more) console.log("Daha fazla var...");
+      break;
+
+    case "channel_join":
+      console.log(`${msg.user_id} kanala girdi`);
+      break;
+
+    case "channel_leave":
+      console.log(`${msg.user_id} kanaldan çıktı`);
+      break;
+
+    case "status_change":
+      console.log(`${msg.user_id} durumu: ${msg.status}`);
+      break;
+  }
+}
+
+// 3. Durum güncelle
+function setStatus(status, text) {
+  ws.send(JSON.stringify({
+    type: "status",
+    status: status,         // "online" | "offline" | "idle" | "dnd"
+    status_text: text || ""
+  }));
+}
+
+// 4. Kanal değiştir
+function joinChannel(groupId, channelId) {
+  ws.send(JSON.stringify({
+    type: "join",
+    group_id: groupId,
+    channel_id: channelId
+  }));
+}
+```
+
+---
+
+## Mimari
+
+```
+event geldi
+   ↓
+visible set (channel-scoped, O(1))
+   ↓
+dedup (channel ∪ friends)
+   ↓
+batch queue (50ms buffer)
+   ↓
+writePump goroutine (async)
+```
 
 ## Güvenlik
 
-| Önlem | Detay |
+| Önlem | Değer |
 |-------|-------|
-| SQL Injection | Parameterized query (`?` placeholder) |
-| Token sınırı | Max 512 karakter |
-| StatusText sınırı | Max 128 karakter, aşan kırpılır |
-| Mesaj boyutu | Max 4096 byte (`SetReadLimit`) |
-| Negatif ID | `group_id < 0` veya `channel_id < 0` reddedilir |
-| Panic recovery | Goroutine'lerde `recover()` ile panic yakalanır |
-| Read deadline | 60 sn timeout, pong ile yenilenir |
+| Token limit | 512 char |
+| StatusText limit | 128 char |
+| Mesaj boyutu | 4096 byte |
+| Negatif ID | Reddedilir |
+| Join rate limit | 200ms |
+| Slow client | Queue dolu → disconnect |
+| Write timeout | 10s |
 
-## memdb Schema
-
-```
-connections tablosu:
-├── id             (primary, unique)     — ws pointer adresi
-├── user_id        (index)               — kullanıcı bazlı sorgulama
-├── group_id       (index)               — grup bazlı sorgulama
-├── channel_id     (index)               — kanal bazlı sorgulama
-├── channel_group  (compound index)      — "channelID,groupID"
-└── user_group     (compound index)      — "userID,groupID"
-```
-
-## 🧪 Test Modu
-
-`env=test` ile başlatıldığında:
-- ✅ Auth bypass — Token doğrulama atlanır, her bağlantıya auto-increment ID
-- ✅ MySQL opsiyonel — Veritabanı bağlantısı atlanır
-- ✅ Atomic counter — `sync/atomic` ile thread-safe ID üretimi
-
-## 📊 Stres Testi
-
-`test/` dizininde Node.js tabanlı stres test aracı.
-
-### Kurulum & Çalıştırma
+## Stres Testi
 
 ```bash
-cd test
-npm install
-
-# Varsayılan: 500 bağlantı
-npm test
-
-# Önceden tanımlı presetler
-npm run test:1k    # 1.000 bağlantı
-npm run test:5k    # 5.000 bağlantı
-npm run test:10k   # 10.000 bağlantı
-
-# Özelleştirilmiş
-node stress.js --url=ws://localhost:8085/!onlines --connections=2000 --batch=100 --delay=50 --duration=20
+cd test && npm install
+npm test           # 500 bağlantı
+npm run test:1k    # 1.000
+npm run test:5k    # 5.000
+npm run test:10k   # 10.000
 ```
 
-### Parametreler
-
-| Parametre | Varsayılan | Açıklama |
-|-----------|-----------|----------|
-| `--url` | `ws://localhost:8085/!onlines` | WebSocket adresi |
-| `--connections` | `500` | Toplam bağlantı sayısı |
-| `--batch` | `50` | Batch başına bağlantı |
-| `--delay` | `100` | Batch arası bekleme (ms) |
-| `--duration` | `10` | Bağlantıları açık tutma süresi (s) |
-
-### Test Senaryosu
-
-Her bağlantı:
-1. WebSocket bağlantısı açar
-2. Auth token gönderir (`test-token-N`)
-3. Gruba ve kanala katılır (10 grup, 5 kanal)
-4. Her 10. bağlantı durum günceller (`idle`)
-5. Her 20. bağlantı kanal değiştirir
-6. Belirtilen süre boyunca açık tutulur
-7. Kapanış → Detaylı rapor yazdırılır
-
-### Rapor İçeriği
-
-- Başarılı/başarısız bağlantı sayısı ve oranı
-- Ortalama, min, max ve P95 bağlantı süresi
-- Mesaj türlerine göre sayılar (presence, join, leave, status_change)
-- Gruplandırılmış hata özeti
-
-## Dosya Yapısı
+## Dosyalar
 
 ```
 online/
-├── main.go          # Ana sunucu
-├── go.mod           # Go module
-├── go.sum           # Bağımlılık hash'leri
-├── example.go.bak   # Referans dosya (derlemeye dahil değil)
+├── main.go         # Sunucu
+├── go.mod/go.sum
 └── test/
-    ├── package.json # Node.js bağımlılıkları
-    └── stress.js    # Stres test aracı
+    ├── package.json
+    └── stress.js
 ```

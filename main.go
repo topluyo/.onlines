@@ -3,7 +3,6 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"log"
 	"net"
@@ -17,7 +16,6 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
-	"github.com/hashicorp/go-memdb"
 )
 
 // ── Sabitler ─────────────────────────────────────────────────────
@@ -26,46 +24,30 @@ const (
 	StatusOnline  = "online"
 	StatusOffline = "offline"
 	StatusIdle    = "idle"
-	StatusDND     = "dnd" // rahatsız etmeyin
+	StatusDND     = "dnd"
 
-	MaxStatusTextLen = 128  // durum metni maksimum uzunluk
-	MaxTokenLen      = 512  // token maksimum uzunluk
-	MaxReadSize      = 4096 // websocket mesaj limit
+	MaxStatusTextLen   = 128
+	MaxTokenLen        = 512
+	MaxReadSize        = 4096
+	WriteQueueSize     = 256
+	WriteTimeout       = 10 * time.Second
+	PingInterval       = 30 * time.Second
+	PongWait           = 60 * time.Second
+	BatchInterval      = 50 * time.Millisecond // event batching aralığı
+	MaxPresenceUsers   = 1000                   // initial presence'da max user sayısı
+	JoinRateLimitMs    = 200                    // aynı user min join aralığı
 )
-
-// ── Veri Yapıları ────────────────────────────────────────────────
-
-// Connection — go-memdb'de saklanan bağlantı kaydı
-type Connection struct {
-	ID           string // ws pointer adresi ("%p")
-	WS           *websocket.Conn
-	WriteMu      sync.Mutex // ws yazma kilidi (concurrent write koruması)
-	UserID       int
-	GroupID      int
-	ChannelID    int
-	Status       string // online/offline/idle/dnd
-	StatusText   string // özel durum metni (boş olabilir)
-	ChannelGroup string // "channelID,groupID" compound index
-	UserGroup    string // "userID,groupID" compound index
-}
-
-// safeWrite — concurrent write panic'i önlemek için mutex ile yazma
-func (c *Connection) safeWrite(messageType int, data []byte) error {
-	c.WriteMu.Lock()
-	defer c.WriteMu.Unlock()
-	return c.WS.WriteMessage(messageType, data)
-}
 
 // ── JSON Mesaj Tipleri ───────────────────────────────────────────
 
 // Client → Server
 type IncomingMessage struct {
-	Type       string `json:"type"`                  // "auth", "join", "status"
-	Token      string `json:"token,omitempty"`        // auth için
-	GroupID    int    `json:"group_id,omitempty"`     // join için
-	ChannelID  int    `json:"channel_id,omitempty"`   // join için
-	Status     string `json:"status,omitempty"`       // status için
-	StatusText string `json:"status_text,omitempty"`  // status için
+	Type       string `json:"type"`
+	Token      string `json:"token,omitempty"`
+	GroupID    int    `json:"group_id,omitempty"`
+	ChannelID  int    `json:"channel_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	StatusText string `json:"status_text,omitempty"`
 }
 
 // Server → Client
@@ -91,16 +73,17 @@ type OutgoingChannelLeave struct {
 	GroupID   int    `json:"group_id"`
 }
 
-type UserStatus struct {
-	S string `json:"s"` // status
-	T string `json:"t"` // status_text
+type UserStatusInfo struct {
+	S string `json:"s"`
+	T string `json:"t"`
 }
 
 type OutgoingPresence struct {
-	Type     string                       `json:"type"`
-	GroupID  int                          `json:"group_id"`
-	Channels map[string][]int             `json:"channels"`
-	Statuses map[string]UserStatus        `json:"statuses"`
+	Type     string                    `json:"type"`
+	GroupID  int                       `json:"group_id"`
+	Channels map[string][]int          `json:"channels"`
+	Statuses map[string]UserStatusInfo `json:"statuses"`
+	HasMore  bool                     `json:"has_more,omitempty"` // lazy load göstergesi
 }
 
 type OutgoingStatusChange struct {
@@ -110,295 +93,654 @@ type OutgoingStatusChange struct {
 	StatusText string `json:"status_text"`
 }
 
-// ── Global Değişkenler ───────────────────────────────────────────
+// Batched events - toplu event mesajı
+type OutgoingBatch struct {
+	Type   string            `json:"type"`    // "batch"
+	Events []json.RawMessage `json:"events"`
+}
 
-var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+// Arkadaş durumları — auth sonrası gönderilir
+type OutgoingFriendStatuses struct {
+	Type     string                    `json:"type"`     // "friends"
+	Friends  map[string]UserStatusInfo `json:"friends"`  // userID → {s, t}
+}
+
+// ── Connection ───────────────────────────────────────────────────
+
+type Connection struct {
+	WS         *websocket.Conn
+	UserID     int
+	GroupID    int
+	ChannelID  int
+	Status     string
+	StatusText string
+	send       chan []byte
+	done       chan struct{}
+	lastJoin   time.Time // join rate limit
+}
+
+// Send — non-blocking push. Bağlantı kapalıysa yoksay, queue doluysa disconnect.
+func (c *Connection) Send(msg []byte) {
+	select {
+	case <-c.done:
+		return // bağlantı kapanmış
+	default:
 	}
-	mdb         *memdb.MemDB
-	db          *sql.DB
-	testMode    bool
-	testUserSeq atomic.Int64
-)
-
-// ── go-memdb Schema ──────────────────────────────────────────────
-
-func createSchema() *memdb.DBSchema {
-	return &memdb.DBSchema{
-		Tables: map[string]*memdb.TableSchema{
-			"connections": {
-				Name: "connections",
-				Indexes: map[string]*memdb.IndexSchema{
-					// Primary index — ws pointer adresi
-					"id": {
-						Name:    "id",
-						Unique:  true,
-						Indexer: &memdb.StringFieldIndex{Field: "ID"},
-					},
-					// UserID index
-					"user_id": {
-						Name:         "user_id",
-						Unique:       false,
-						AllowMissing: true,
-						Indexer:      &memdb.IntFieldIndex{Field: "UserID"},
-					},
-					// ChannelID index
-					"channel_id": {
-						Name:         "channel_id",
-						Unique:       false,
-						AllowMissing: true,
-						Indexer:      &memdb.IntFieldIndex{Field: "ChannelID"},
-					},
-					// GroupID index
-					"group_id": {
-						Name:         "group_id",
-						Unique:       false,
-						AllowMissing: true,
-						Indexer:      &memdb.IntFieldIndex{Field: "GroupID"},
-					},
-					// Compound index: channel_id + group_id
-					"channel_group": {
-						Name:         "channel_group",
-						Unique:       false,
-						AllowMissing: true,
-						Indexer:      &memdb.StringFieldIndex{Field: "ChannelGroup"},
-					},
-					// Compound index: user_id + group_id
-					"user_group": {
-						Name:         "user_group",
-						Unique:       false,
-						AllowMissing: true,
-						Indexer:      &memdb.StringFieldIndex{Field: "UserGroup"},
-					},
-				},
-			},
-		},
+	select {
+	case c.send <- msg:
+	case <-c.done:
+		return
+	default:
+		c.Close() // queue dolu → slow client
 	}
 }
 
-// ── Connection CRUD ──────────────────────────────────────────────
-
-func connID(ws *websocket.Conn) string {
-	return fmt.Sprintf("%p", ws)
-}
-
-func insertConn(c *Connection) {
-	txn := mdb.Txn(true)
-	txn.Insert("connections", c)
-	txn.Commit()
-}
-
-func deleteConn(ws *websocket.Conn) (*Connection, bool) {
-	txn := mdb.Txn(true)
-	raw, err := txn.First("connections", "id", connID(ws))
-	if err == nil && raw != nil {
-		txn.Delete("connections", raw)
-		txn.Commit()
-		return raw.(*Connection), true
-	}
-	txn.Commit()
-	return nil, false
-}
-
-func getConn(ws *websocket.Conn) (*Connection, bool) {
-	txn := mdb.Txn(false)
-	defer txn.Abort()
-	raw, err := txn.First("connections", "id", connID(ws))
-	if err != nil || raw == nil {
-		return nil, false
-	}
-	return raw.(*Connection), true
-}
-
-// updateConn — memdb'de bağlantı kaydını güncelle (delete + insert)
-func updateConn(c *Connection) {
-	txn := mdb.Txn(true)
-	old, err := txn.First("connections", "id", c.ID)
-	if err == nil && old != nil {
-		txn.Delete("connections", old)
-	}
-	txn.Insert("connections", c)
-	txn.Commit()
-}
-
-// getConnsByGroup — belirli bir gruptaki tüm bağlantıları döndür
-func getConnsByGroup(groupID int) []*Connection {
-	txn := mdb.Txn(false)
-	defer txn.Abort()
-	it, err := txn.Get("connections", "group_id", groupID)
-	if err != nil {
-		return nil
-	}
-	var conns []*Connection
-	for obj := it.Next(); obj != nil; obj = it.Next() {
-		conns = append(conns, obj.(*Connection))
-	}
-	return conns
-}
-
-// ── Presence Mantığı ─────────────────────────────────────────────
-
-// buildPresenceMap — grup içindeki tüm kullanıcıların kanal konumlarını oluştur
-// Çevrimdışı kullanıcılar: sadece bir kanalda iseler gösterilir
-func buildPresenceMap(groupID int) (map[string][]int, map[string]UserStatus) {
-	conns := getConnsByGroup(groupID)
-
-	channels := make(map[string][]int)       // channelID → [userID, ...]
-	statuses := make(map[string]UserStatus)   // userID → {status, text}
-	seen := make(map[int]bool)                // aynı kullanıcıyı tekrar eklememek için
-
-	for _, c := range conns {
-		if seen[c.UserID] {
-			continue
-		}
-		seen[c.UserID] = true
-
-		// Çevrimdışı kullanıcı kanalda değilse gösterme
-		if c.Status == StatusOffline && c.ChannelID == 0 {
-			continue
-		}
-
-		userIDStr := strconv.Itoa(c.UserID)
-		statuses[userIDStr] = UserStatus{S: c.Status, T: c.StatusText}
-
-		if c.ChannelID != 0 {
-			chStr := strconv.Itoa(c.ChannelID)
-			channels[chStr] = append(channels[chStr], c.UserID)
-		}
-	}
-
-	return channels, statuses
-}
-
-// ── Broadcast Helpers ────────────────────────────────────────────
-
-// broadcastToGroup — gruptaki tüm bağlantılara mesaj gönder (göndereni hariç tut)
-func broadcastToGroup(groupID int, excludeWS *websocket.Conn, msg []byte) {
-	conns := getConnsByGroup(groupID)
-	for _, c := range conns {
-		if c.WS == excludeWS {
-			continue
-		}
-		c.safeWrite(websocket.TextMessage, msg)
-	}
-}
-
-// sendJSON — tek bir bağlantıya JSON mesaj gönder
-func sendJSON(conn *Connection, v interface{}) {
+// SendJSON — serialize + queue push
+func (c *Connection) SendJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	conn.safeWrite(websocket.TextMessage, data)
+	c.Send(data)
 }
 
-// ── Event İşleyicileri ───────────────────────────────────────────
+// Close — idempotent kapatma
+func (c *Connection) Close() {
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+}
 
-func handleJoin(ws *websocket.Conn, conn *Connection, msg IncomingMessage) {
-	// ID aralık kontrolü — negatif veya mantıksız büyük değerleri reddet
-	if msg.GroupID < 0 || msg.ChannelID < 0 {
-		return
+// writePump — dedicated async writer + ping + batch drain
+func (c *Connection) writePump() {
+	ticker := time.NewTicker(PingInterval)
+	defer func() {
+		ticker.Stop()
+		c.WS.Close()
+	}()
+
+	for {
+		select {
+		case msg, ok := <-c.send:
+			if !ok {
+				c.WS.WriteMessage(websocket.CloseMessage, nil)
+				return
+			}
+			c.WS.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			if err := c.WS.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+			// Batch drain — queue'daki kalan mesajları hemen gönder
+			n := len(c.send)
+			for i := 0; i < n; i++ {
+				next, ok := <-c.send
+				if !ok {
+					return
+				}
+				if err := c.WS.WriteMessage(websocket.TextMessage, next); err != nil {
+					return
+				}
+			}
+		case <-ticker.C:
+			c.WS.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			if err := c.WS.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// ── channelKey — compound key "groupID:channelID" ────────────────
+
+type channelKey struct {
+	GroupID   int
+	ChannelID int
+}
+
+// ── Hub — Merkezi Bağlantı Yöneticisi ───────────────────────────
+
+type Hub struct {
+	mu          sync.RWMutex
+	connections map[*websocket.Conn]*Connection
+	users       map[int][]*Connection
+	groups      map[int][]*Connection
+	channels    map[channelKey][]*Connection    // ← visible set: channel bazlı
+	friends     map[int][]int
+
+	// Event batching
+	batchMu     sync.Mutex
+	batchQueues map[int][]json.RawMessage       // userID → pending events
+	batchTimer  *time.Ticker
+}
+
+var hub *Hub
+
+func newHub() *Hub {
+	h := &Hub{
+		connections: make(map[*websocket.Conn]*Connection),
+		users:       make(map[int][]*Connection),
+		groups:      make(map[int][]*Connection),
+		channels:    make(map[channelKey][]*Connection),
+		friends:     make(map[int][]int),
+		batchQueues: make(map[int][]json.RawMessage),
+	}
+	// Batch flush ticker başlat
+	h.batchTimer = time.NewTicker(BatchInterval)
+	go h.batchFlusher()
+	return h
+}
+
+// ── Batch Event System ─────────────────────────────────────────
+
+// queueEventBulk — birden fazla kullanıcıya aynı event'i tek lock ile ekle
+func (h *Hub) queueEventBulk(userIDs []int, event []byte) {
+	raw := json.RawMessage(event)
+	h.batchMu.Lock()
+	for _, uid := range userIDs {
+		h.batchQueues[uid] = append(h.batchQueues[uid], raw)
+	}
+	h.batchMu.Unlock()
+}
+
+// queueEventSingle — tek kullanıcıya event ekle
+func (h *Hub) queueEventSingle(userID int, event []byte) {
+	h.batchMu.Lock()
+	h.batchQueues[userID] = append(h.batchQueues[userID], json.RawMessage(event))
+	h.batchMu.Unlock()
+}
+
+// broadcastToGroup — gruptaki herkese event (dedup + bulk queue)
+// mu.RLock veya mu.Lock altında çağrılabilir (batchMu ayrı lock)
+func (h *Hub) broadcastToGroup(groupID int, excludeUserID int, event []byte) {
+	targets := collectGroupTargets(h.groups[groupID], excludeUserID)
+	if len(targets) > 0 {
+		h.queueEventBulk(targets, event)
+	}
+}
+
+// batchFlusher — periyodik flush, kısa lock süreleri
+func (h *Hub) batchFlusher() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("batchFlusher panic:", r)
+			go h.batchFlusher() // yeniden başlat
+		}
+	}()
+
+	for range h.batchTimer.C {
+		// 1. Batch queue snapshot (kısa lock)
+		h.batchMu.Lock()
+		if len(h.batchQueues) == 0 {
+			h.batchMu.Unlock()
+			continue
+		}
+		queues := h.batchQueues
+		h.batchQueues = make(map[int][]json.RawMessage, len(queues))
+		h.batchMu.Unlock()
+
+		// 2. User→conns snapshot (kısa RLock, sadece pointer kopyalama)
+		type delivery struct {
+			conns  []*Connection
+			events []json.RawMessage
+		}
+		deliveries := make([]delivery, 0, len(queues))
+
+		h.mu.RLock()
+		for userID, events := range queues {
+			conns := h.users[userID]
+			if len(conns) == 0 {
+				continue
+			}
+			cc := make([]*Connection, len(conns))
+			copy(cc, conns)
+			deliveries = append(deliveries, delivery{conns: cc, events: events})
+		}
+		h.mu.RUnlock()
+
+		// 3. Gönderim (hiçbir lock tutmadan)
+		for _, d := range deliveries {
+			var msg []byte
+			if len(d.events) == 1 {
+				msg = d.events[0]
+			} else {
+				msg, _ = json.Marshal(OutgoingBatch{
+					Type:   "batch",
+					Events: d.events,
+				})
+			}
+			for _, c := range d.conns {
+				c.Send(msg)
+			}
+		}
+	}
+}
+
+// ── Hub CRUD ─────────────────────────────────────────────────────
+
+func (h *Hub) register(c *Connection) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connections[c.WS] = c
+	h.users[c.UserID] = append(h.users[c.UserID], c)
+}
+
+func (h *Hub) unregister(c *Connection) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.connections, c.WS)
+
+	// users
+	if conns, ok := h.users[c.UserID]; ok {
+		h.users[c.UserID] = removeConn(conns, c)
+		if len(h.users[c.UserID]) == 0 {
+			delete(h.users, c.UserID)
+			delete(h.friends, c.UserID) // son bağlantı → friend cache temizle
+		}
 	}
 
-	oldGroupID := conn.GroupID
-	oldChannelID := conn.ChannelID
+	// groups
+	if c.GroupID != 0 {
+		if conns, ok := h.groups[c.GroupID]; ok {
+			h.groups[c.GroupID] = removeConn(conns, c)
+			if len(h.groups[c.GroupID]) == 0 {
+				delete(h.groups, c.GroupID)
+			}
+		}
+	}
 
-	newGroupID := msg.GroupID
-	newChannelID := msg.ChannelID
+	// channels (visible set)
+	if c.GroupID != 0 && c.ChannelID != 0 {
+		ck := channelKey{c.GroupID, c.ChannelID}
+		if conns, ok := h.channels[ck]; ok {
+			h.channels[ck] = removeConn(conns, c)
+			if len(h.channels[ck]) == 0 {
+				delete(h.channels, ck)
+			}
+		}
+	}
 
-	// Eski kanaldan çıkış bildirimi
+	c.Close() // done kapat → writePump durur → ws kapanır
+}
+
+// ── Interest-Based Routing ───────────────────────────────────────
+
+// joinGroup — group-scoped broadcast + partial presence
+// Lock stratejisi: mu.Lock sadece veri mutasyonu için, broadcast lock dışında
+func (h *Hub) joinGroup(c *Connection, groupID, channelID int) {
+	// Rate limit kontrolü
+	now := time.Now()
+	if now.Sub(c.lastJoin) < time.Duration(JoinRateLimitMs)*time.Millisecond {
+		return
+	}
+	c.lastJoin = now
+
+	// Broadcast için toplanacak bilgiler
+	var leaveTargets []int
+	var leaveMsg []byte
+	var joinTargets []int
+	var joinMsg []byte
+	var presence *OutgoingPresence
+
+	h.mu.Lock()
+
+	oldGroupID := c.GroupID
+	oldChannelID := c.ChannelID
+
+	// ── 1. Eski channel'dan çıkar ────────────────────────────────
+
 	if oldGroupID != 0 && oldChannelID != 0 {
-		leaveMsg, _ := json.Marshal(OutgoingChannelLeave{
+		oldCK := channelKey{oldGroupID, oldChannelID}
+		if conns, ok := h.channels[oldCK]; ok {
+			h.channels[oldCK] = removeConn(conns, c)
+			if len(h.channels[oldCK]) == 0 {
+				delete(h.channels, oldCK)
+			}
+		}
+
+		// Leave hedeflerini topla (broadcast lock dışında yapılacak)
+		leaveMsg, _ = json.Marshal(OutgoingChannelLeave{
 			Type:      "channel_leave",
-			UserID:    conn.UserID,
+			UserID:    c.UserID,
 			ChannelID: oldChannelID,
 			GroupID:   oldGroupID,
 		})
-		broadcastToGroup(oldGroupID, ws, leaveMsg)
+		leaveTargets = collectGroupTargets(h.groups[oldGroupID], c.UserID)
 	}
 
-	// Bağlantıyı güncelle
-	conn.GroupID = newGroupID
-	conn.ChannelID = newChannelID
-	conn.ChannelGroup = fmt.Sprintf("%d,%d", newChannelID, newGroupID)
-	conn.UserGroup = fmt.Sprintf("%d,%d", conn.UserID, newGroupID)
-	updateConn(conn)
-
-	// Yeni kanala giriş bildirimi (gruptakilere)
-	if newGroupID != 0 && newChannelID != 0 {
-		joinMsg, _ := json.Marshal(OutgoingChannelJoin{
-			Type:       "channel_join",
-			UserID:     conn.UserID,
-			ChannelID:  newChannelID,
-			GroupID:    newGroupID,
-			Status:     conn.Status,
-			StatusText: conn.StatusText,
-		})
-		broadcastToGroup(newGroupID, ws, joinMsg)
+	// Eski gruptan çıkar
+	if oldGroupID != 0 && oldGroupID != groupID {
+		if conns, ok := h.groups[oldGroupID]; ok {
+			h.groups[oldGroupID] = removeConn(conns, c)
+			if len(h.groups[oldGroupID]) == 0 {
+				delete(h.groups, oldGroupID)
+			}
+		}
 	}
 
-	// Kullanıcıya mevcut presence haritasını gönder
-	if newGroupID != 0 {
-		channels, statuses := buildPresenceMap(newGroupID)
-		sendJSON(conn, OutgoingPresence{
-			Type:     "presence",
-			GroupID:  newGroupID,
-			Channels: channels,
-			Statuses: statuses,
-		})
+	// ── 2. Yeni channel'a ekle ───────────────────────────────────
+
+	c.GroupID = groupID
+	c.ChannelID = channelID
+
+	if groupID != 0 {
+		if oldGroupID != groupID {
+			h.groups[groupID] = append(h.groups[groupID], c)
+		}
+
+		if channelID != 0 {
+			newCK := channelKey{groupID, channelID}
+			h.channels[newCK] = append(h.channels[newCK], c)
+
+			// Join hedeflerini topla
+			joinMsg, _ = json.Marshal(OutgoingChannelJoin{
+				Type:       "channel_join",
+				UserID:     c.UserID,
+				ChannelID:  channelID,
+				GroupID:    groupID,
+				Status:     c.Status,
+				StatusText: c.StatusText,
+			})
+			joinTargets = collectGroupTargets(h.groups[groupID], c.UserID)
+		}
+
+		// Presence sadece yeni gruba katılınca gönder (kanal değişikliğinde gönderme)
+		if oldGroupID != groupID {
+			presence = h.buildPartialPresenceLocked(groupID, channelID)
+		}
+	}
+
+	// ── mu.Unlock — TÜM broadcast işlemleri lock dışında ─────────
+	h.mu.Unlock()
+
+	// Broadcast (lock tutmadan)
+	if len(leaveTargets) > 0 {
+		h.queueEventBulk(leaveTargets, leaveMsg)
+	}
+	if len(joinTargets) > 0 {
+		h.queueEventBulk(joinTargets, joinMsg)
+	}
+	if presence != nil {
+		c.SendJSON(presence)
 	}
 }
 
-func handleStatus(ws *websocket.Conn, conn *Connection, msg IncomingMessage) {
-	// Geçerli durum kontrolü
-	switch msg.Status {
-	case StatusOnline, StatusOffline, StatusIdle, StatusDND:
-		// geçerli
+// collectGroupTargets — gruptaki unique userID'leri topla (exclude hariç)
+// mu.Lock altında çağrılmalı
+func collectGroupTargets(groupConns []*Connection, excludeUserID int) []int {
+	seen := make(map[int]bool)
+	if excludeUserID != 0 {
+		seen[excludeUserID] = true
+	}
+	var targets []int
+	for _, gc := range groupConns {
+		if !seen[gc.UserID] {
+			seen[gc.UserID] = true
+			targets = append(targets, gc.UserID)
+		}
+	}
+	return targets
+}
+
+// updateStatus — group-scoped + friend broadcast (dedup + bulk)
+func (h *Hub) updateStatus(c *Connection, status, statusText string) {
+	h.mu.Lock()
+
+	c.Status = status
+	c.StatusText = statusText
+
+	statusMsg, _ := json.Marshal(OutgoingStatusChange{
+		Type:       "status_change",
+		UserID:     c.UserID,
+		Status:     status,
+		StatusText: statusText,
+	})
+
+	// Hedef: gruptakiler + arkadaşlar (dedup)
+	seen := make(map[int]bool)
+	seen[c.UserID] = true
+	var targets []int
+
+	// 1. Gruptaki herkes
+	if c.GroupID != 0 {
+		for _, gc := range h.groups[c.GroupID] {
+			if !seen[gc.UserID] {
+				seen[gc.UserID] = true
+				targets = append(targets, gc.UserID)
+			}
+		}
+	}
+
+	// 2. Arkadaşlar (grup dışındakiler de)
+	if fids, ok := h.friends[c.UserID]; ok {
+		for _, fid := range fids {
+			if !seen[fid] {
+				seen[fid] = true
+				targets = append(targets, fid)
+			}
+		}
+	}
+
+	h.mu.Unlock()
+
+	if len(targets) > 0 {
+		h.queueEventBulk(targets, statusMsg)
+	}
+}
+
+// handleDisconnect — temizlik + group-scoped leave bildirimi
+// Lock stratejisi: RLock sadece target toplama, broadcast lock dışında
+func (h *Hub) handleDisconnect(c *Connection) {
+	groupID := c.GroupID
+	channelID := c.ChannelID
+	userID := c.UserID
+
+	h.unregister(c)
+	c.Close()
+
+	if groupID != 0 && channelID != 0 {
+		var leaveTargets []int
+
+		h.mu.RLock()
+		ck := channelKey{groupID, channelID}
+		stillInChannel := false
+		for _, gc := range h.channels[ck] {
+			if gc.UserID == userID {
+				stillInChannel = true
+				break
+			}
+		}
+		if !stillInChannel {
+			leaveTargets = collectGroupTargets(h.groups[groupID], 0)
+		}
+		h.mu.RUnlock()
+
+		// Broadcast lock dışında
+		if len(leaveTargets) > 0 {
+			leaveMsg, _ := json.Marshal(OutgoingChannelLeave{
+				Type:      "channel_leave",
+				UserID:    userID,
+				ChannelID: channelID,
+				GroupID:   groupID,
+			})
+			h.queueEventBulk(leaveTargets, leaveMsg)
+		}
+	}
+}
+
+func (h *Hub) setFriends(userID int, friendIDs []int) {
+	h.mu.Lock()
+	h.friends[userID] = friendIDs
+	h.mu.Unlock()
+}
+
+// getOnlineFriendStatuses — arkadaşların çevrimiçi durumlarını döndür (offline hariç)
+// Birden fazla bağlantı varsa en iyi durumu seç (online > idle > dnd)
+func (h *Hub) getOnlineFriendStatuses(userID int) map[string]UserStatusInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	fids, ok := h.friends[userID]
+	if !ok || len(fids) == 0 {
+		return nil
+	}
+
+	result := make(map[string]UserStatusInfo)
+	for _, fid := range fids {
+		conns, ok := h.users[fid]
+		if !ok || len(conns) == 0 {
+			continue
+		}
+		// Tüm bağlantılardan en iyi durumu seç
+		best := conns[0]
+		for _, c := range conns[1:] {
+			if statusPriority(c.Status) > statusPriority(best.Status) {
+				best = c
+			}
+		}
+		if best.Status == StatusOffline {
+			continue
+		}
+		result[strconv.Itoa(fid)] = UserStatusInfo{S: best.Status, T: best.StatusText}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// statusPriority — durum öncelik sırası (yüksek = daha görünür)
+func statusPriority(s string) int {
+	switch s {
+	case StatusOnline:
+		return 4
+	case StatusIdle:
+		return 3
+	case StatusDND:
+		return 2
+	case StatusOffline:
+		return 1
 	default:
-		return // geçersiz status → yoksay
-	}
-
-	// StatusText uzunluk sınırı
-	statusText := msg.StatusText
-	if len(statusText) > MaxStatusTextLen {
-		statusText = statusText[:MaxStatusTextLen]
-	}
-
-	conn.Status = msg.Status
-	conn.StatusText = statusText
-	updateConn(conn)
-
-	// Gruptakilere bildir
-	if conn.GroupID != 0 {
-		statusMsg, _ := json.Marshal(OutgoingStatusChange{
-			Type:       "status_change",
-			UserID:     conn.UserID,
-			Status:     conn.Status,
-			StatusText: conn.StatusText,
-		})
-		broadcastToGroup(conn.GroupID, ws, statusMsg)
+		return 0
 	}
 }
 
-func handleDisconnect(ws *websocket.Conn) {
-	conn, ok := deleteConn(ws)
-	if !ok {
-		return
+// ── Hub Internal ─────────────────────────────────────────────────
+
+// queueEventLocked — batch queue'ya event ekle (batchMu ile)
+func (h *Hub) queueEventLocked(userID int, event []byte) {
+	h.batchMu.Lock()
+	h.batchQueues[userID] = append(h.batchQueues[userID], json.RawMessage(event))
+	h.batchMu.Unlock()
+}
+
+// buildPartialPresenceLocked — grup içindeki presence (lock altında)
+// Aynı kullanıcı farklı kanallarda → her kanalda göster
+// Aynı kullanıcı aynı kanalda → bir kez göster (dedup per channel)
+func (h *Hub) buildPartialPresenceLocked(groupID, channelID int) *OutgoingPresence {
+	result := &OutgoingPresence{
+		Type:     "presence",
+		GroupID:  groupID,
+		Channels: make(map[string][]int),
+		Statuses: make(map[string]UserStatusInfo),
 	}
-	// Gruptakilere kanal terk bildirimi
-	if conn.GroupID != 0 && conn.ChannelID != 0 {
-		leaveMsg, _ := json.Marshal(OutgoingChannelLeave{
-			Type:      "channel_leave",
-			UserID:    conn.UserID,
-			ChannelID: conn.ChannelID,
-			GroupID:   conn.GroupID,
-		})
-		broadcastToGroup(conn.GroupID, nil, leaveMsg)
+
+	// per-(channel, user) dedup
+	type chUserKey struct {
+		ch   int
+		user int
 	}
+	seen := make(map[chUserKey]bool)
+	seenStatus := make(map[int]bool) // status dedup (aynı userı farklı kanallarda göster ama status 1 kez)
+	count := 0
+
+	// Önce istenen channel
+	if channelID != 0 {
+		ck := channelKey{groupID, channelID}
+		chStr := strconv.Itoa(channelID)
+		if conns, ok := h.channels[ck]; ok {
+			for _, gc := range conns {
+				key := chUserKey{channelID, gc.UserID}
+				if seen[key] {
+					continue // aynı user aynı kanalda → dedup
+				}
+				if gc.Status == StatusOffline {
+					continue
+				}
+				seen[key] = true
+				result.Channels[chStr] = append(result.Channels[chStr], gc.UserID)
+				if !seenStatus[gc.UserID] {
+					seenStatus[gc.UserID] = true
+					result.Statuses[strconv.Itoa(gc.UserID)] = UserStatusInfo{S: gc.Status, T: gc.StatusText}
+					count++
+				}
+				if count >= MaxPresenceUsers {
+					result.HasMore = true
+					return result
+				}
+			}
+		}
+	}
+
+	// Sonra gruptaki diğer channel'lar
+	if conns, ok := h.groups[groupID]; ok {
+		for _, gc := range conns {
+			if gc.ChannelID == 0 {
+				continue
+			}
+			key := chUserKey{gc.ChannelID, gc.UserID}
+			if seen[key] {
+				continue
+			}
+			if gc.Status == StatusOffline {
+				continue
+			}
+			seen[key] = true
+			chStr := strconv.Itoa(gc.ChannelID)
+			result.Channels[chStr] = append(result.Channels[chStr], gc.UserID)
+			if !seenStatus[gc.UserID] {
+				seenStatus[gc.UserID] = true
+				result.Statuses[strconv.Itoa(gc.UserID)] = UserStatusInfo{S: gc.Status, T: gc.StatusText}
+				count++
+			}
+			if count >= MaxPresenceUsers {
+				result.HasMore = true
+				return result
+			}
+		}
+	}
+
+	return result
+}
+
+// removeConn — swap-remove (O(1))
+func removeConn(slice []*Connection, c *Connection) []*Connection {
+	for i, v := range slice {
+		if v == c {
+			slice[i] = slice[len(slice)-1]
+			return slice[:len(slice)-1]
+		}
+	}
+	return slice
 }
 
 // ── WebSocket Handler ────────────────────────────────────────────
+
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  512,
+		WriteBufferSize: 512,
+		CheckOrigin:     func(r *http.Request) bool { return true },
+	}
+	db          *sql.DB
+	testMode    bool
+	testUserSeq atomic.Int64
+)
 
 func onlineHandler(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
@@ -406,36 +748,34 @@ func onlineHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
-	defer ws.Close()
-	defer handleDisconnect(ws)
 
-	// Read deadline & pong handler
 	ws.SetReadLimit(MaxReadSize)
-	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+	ws.SetReadDeadline(time.Now().Add(PongWait))
 	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+		ws.SetReadDeadline(time.Now().Add(PongWait))
 		return nil
 	})
 
-	// ── 1. Auth (ilk mesaj zorunlu) ──────────────────────────────
+	// ── 1. Auth ──────────────────────────────────────────────────
 
 	_, rawMsg, err := ws.ReadMessage()
 	if err != nil {
+		ws.Close()
 		return
 	}
 
 	var authMsg IncomingMessage
 	if err := json.Unmarshal(rawMsg, &authMsg); err != nil || authMsg.Type != "auth" {
-		// İlk mesaj auth değilse bağlantıyı kapat
 		data, _ := json.Marshal(OutgoingAuth{Type: "auth", Success: false})
 		ws.WriteMessage(websocket.TextMessage, data)
+		ws.Close()
 		return
 	}
 
-	// Token uzunluk kontrolü — çok uzun tokenlar reddedilir
 	if len(authMsg.Token) > MaxTokenLen {
 		data, _ := json.Marshal(OutgoingAuth{Type: "auth", Success: false})
 		ws.WriteMessage(websocket.TextMessage, data)
+		ws.Close()
 		return
 	}
 
@@ -443,57 +783,55 @@ func onlineHandler(w http.ResponseWriter, r *http.Request) {
 	if userID == 0 {
 		data, _ := json.Marshal(OutgoingAuth{Type: "auth", Success: false})
 		ws.WriteMessage(websocket.TextMessage, data)
+		ws.Close()
 		return
 	}
 
-	// Bağlantıyı memdb'ye kaydet
 	conn := &Connection{
-		ID:         connID(ws),
 		WS:         ws,
 		UserID:     userID,
-		GroupID:    0,
-		ChannelID:  0,
 		Status:     StatusOnline,
 		StatusText: "",
+		send:       make(chan []byte, WriteQueueSize),
+		done:       make(chan struct{}),
 	}
-	insertConn(conn)
 
-	// Auth başarılı bildirimi
-	sendJSON(conn, OutgoingAuth{
+	hub.register(conn)
+
+	// Arkadaş listesini async yükle + durumlarını gönder
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Println("loadFriends panic:", r)
+			}
+		}()
+		friends := loadFriends(userID)
+		if len(friends) > 0 {
+			hub.setFriends(userID, friends)
+
+			// Arkadaşların çevrimiçi durumlarını gönder
+			statuses := hub.getOnlineFriendStatuses(userID)
+			if statuses != nil {
+				conn.SendJSON(OutgoingFriendStatuses{
+					Type:    "friends",
+					Friends: statuses,
+				})
+			}
+		}
+	}()
+
+	// Auth başarılı
+	conn.SendJSON(OutgoingAuth{
 		Type:    "auth",
 		Success: true,
 		UserID:  userID,
 	})
 
-	// ── Ping ticker — bağlantıyı canlı tut ──────────────────────
+	// Writer goroutine
+	go conn.writePump()
+	defer hub.handleDisconnect(conn)
 
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Println("ping goroutine panic recovered:", r)
-			}
-		}()
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				c, ok := getConn(ws)
-				if !ok {
-					return
-				}
-				if err := c.safeWrite(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			}
-		}
-	}()
-	defer close(done)
-
-	// ── 2. Mesaj döngüsü ─────────────────────────────────────────
+	// ── 2. Read loop ─────────────────────────────────────────────
 
 	for {
 		_, rawMsg, err := ws.ReadMessage()
@@ -506,22 +844,51 @@ func onlineHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Her mesajda güncel conn'u al (güncellenmiş olabilir)
-		conn, ok := getConn(ws)
-		if !ok {
-			break
-		}
-
 		switch msg.Type {
 		case "join":
-			handleJoin(ws, conn, msg)
+			if msg.GroupID < 0 || msg.ChannelID < 0 {
+				continue
+			}
+			hub.joinGroup(conn, msg.GroupID, msg.ChannelID)
+
 		case "status":
-			handleStatus(ws, conn, msg)
+			switch msg.Status {
+			case StatusOnline, StatusOffline, StatusIdle, StatusDND:
+			default:
+				continue
+			}
+			statusText := msg.StatusText
+			if len(statusText) > MaxStatusTextLen {
+				statusText = statusText[:MaxStatusTextLen]
+			}
+			hub.updateStatus(conn, msg.Status, statusText)
 		}
 	}
 }
 
-// ── User Identification (example.go ile aynı) ───────────────────
+// ── Friend System ────────────────────────────────────────────────
+
+func loadFriends(userID int) []int {
+	if testMode || db == nil {
+		return nil
+	}
+	rows, err := db.Query("SELECT `friend_id` FROM `friend` WHERE `user_id` = ? AND `status` = 1", userID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var friends []int
+	for rows.Next() {
+		var fid int
+		if err := rows.Scan(&fid); err == nil {
+			friends = append(friends, fid)
+		}
+	}
+	return friends
+}
+
+// ── User Identification ──────────────────────────────────────────
 
 func Func_User_IP_Address(r *http.Request) string {
 	headers := []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"}
@@ -545,11 +912,9 @@ func Func_User_New_Negative_Hash_Number(s string) int {
 }
 
 func Func_User_ID(r *http.Request, token string) int {
-	// Test modunda auto-increment ID ver, DB sorgusu atla
 	if testMode {
 		return int(testUserSeq.Add(1))
 	}
-
 	var user_id int
 	if token != "" {
 		db.QueryRow("SELECT `user_id` FROM `session` WHERE `token` = ? AND `expire` > UNIX_TIMESTAMP()", token).Scan(&user_id)
@@ -562,28 +927,6 @@ func Func_User_ID(r *http.Request, token string) int {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-func ToInt(number string) int {
-	i, err := strconv.Atoi(number)
-	if err != nil {
-		return 0
-	}
-	return i
-}
-
-func ToString(number int) string {
-	return strconv.Itoa(number)
-}
-
-func ToJson(data interface{}) string {
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return "{}"
-	}
-	return string(bytes)
-}
-
-// argument — komut satırı argümanlarını oku (example.go ile aynı format)
-// Kullanım: go run main.go port=8080 env=test
 func argument(a string) string {
 	response := ""
 	for _, arg := range os.Args {
@@ -598,22 +941,15 @@ func argument(a string) string {
 // ── Main ─────────────────────────────────────────────────────────
 
 func main() {
-	// go-memdb oluştur
-	schema := createSchema()
-	var err error
-	mdb, err = memdb.NewMemDB(schema)
-	if err != nil {
-		log.Fatal("memdb init error:", err)
-	}
+	hub = newHub()
 
-	// Test modu kontrolü (example.go ile aynı)
 	testMode = argument("env") == "test"
 	if testMode {
 		log.Println("⚠ TEST MODE — auth bypass aktif")
 	}
 
-	// MySQL bağlantısı (test modunda atla)
 	if !testMode {
+		var err error
 		//db, err = sql.Open("mysql", "master:master@tcp(127.0.0.1:3306)/db")
 		db, err = sql.Open(
 			"mysql",
@@ -628,13 +964,20 @@ func main() {
 		defer db.Close()
 	}
 
-	// HTTP handler'ları
 	http.HandleFunc("/!onlines", onlineHandler)
 
 	port := argument("port")
 	if port == "" {
 		port = "8085"
 	}
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    4096,
+	}
+
 	log.Println("!onlines server started at :" + port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Fatal(server.ListenAndServe())
 }

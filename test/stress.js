@@ -44,6 +44,8 @@ const stats = {
   failed: 0,
   messagesSent: 0,
   messagesReceived: 0,
+  batchMessagesReceived: 0,
+  eventsInBatches: 0,
   presenceReceived: 0,
   joinReceived: 0,
   leaveReceived: 0,
@@ -100,73 +102,80 @@ function createConnection(index) {
       stats.messagesSent++;
     });
 
+    // Event işleyici (batch destekli)
+    function handleEvent(msg) {
+      switch (msg.type) {
+        case "auth":
+          if (msg.success) {
+            stats.authed++;
+            const joinMsg = JSON.stringify({
+              type: "join",
+              group_id: groupId,
+              channel_id: channelId,
+            });
+            ws.send(joinMsg);
+            stats.messagesSent++;
+
+            if (index % 10 === 0) {
+              setTimeout(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "status",
+                    status: "idle",
+                    status_text: `Bot #${index}`,
+                  }));
+                  stats.messagesSent++;
+                }
+              }, 500);
+            }
+
+            if (index % 20 === 0) {
+              setTimeout(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "join",
+                    group_id: groupId,
+                    channel_id: ((channelId % 5) + 1),
+                  }));
+                  stats.messagesSent++;
+                }
+              }, 1000);
+            }
+          } else {
+            stats.failed++;
+            addError("Auth failed");
+          }
+          break;
+        case "batch":
+          stats.batchMessagesReceived++;
+          if (Array.isArray(msg.events)) {
+            stats.eventsInBatches += msg.events.length;
+            for (const evt of msg.events) {
+              handleEvent(typeof evt === "string" ? JSON.parse(evt) : evt);
+            }
+          }
+          break;
+        case "presence":
+          stats.presenceReceived++;
+          break;
+        case "channel_join":
+          stats.joinReceived++;
+          break;
+        case "channel_leave":
+          stats.leaveReceived++;
+          break;
+        case "status_change":
+          stats.statusChangeReceived++;
+          break;
+      }
+    }
+
     ws.on("message", (data) => {
       stats.messagesReceived++;
       try {
-        const msg = JSON.parse(data.toString());
-
-        switch (msg.type) {
-          case "auth":
-            if (msg.success) {
-              stats.authed++;
-              // 2. Kanala katıl
-              const joinMsg = JSON.stringify({
-                type: "join",
-                group_id: groupId,
-                channel_id: channelId,
-              });
-              ws.send(joinMsg);
-              stats.messagesSent++;
-
-              // 3. Her 10. bağlantı durum günceller
-              if (index % 10 === 0) {
-                setTimeout(() => {
-                  if (ws.readyState === WebSocket.OPEN) {
-                    const statusMsg = JSON.stringify({
-                      type: "status",
-                      status: "idle",
-                      status_text: `Bot #${index}`,
-                    });
-                    ws.send(statusMsg);
-                    stats.messagesSent++;
-                  }
-                }, 500);
-              }
-
-              // 4. Her 20. bağlantı kanal değiştirir
-              if (index % 20 === 0) {
-                setTimeout(() => {
-                  if (ws.readyState === WebSocket.OPEN) {
-                    const switchMsg = JSON.stringify({
-                      type: "join",
-                      group_id: groupId,
-                      channel_id: ((channelId % 5) + 1),
-                    });
-                    ws.send(switchMsg);
-                    stats.messagesSent++;
-                  }
-                }, 1000);
-              }
-            } else {
-              stats.failed++;
-              addError("Auth failed");
-            }
-            break;
-          case "presence":
-            stats.presenceReceived++;
-            break;
-          case "channel_join":
-            stats.joinReceived++;
-            break;
-          case "channel_leave":
-            stats.leaveReceived++;
-            break;
-          case "status_change":
-            stats.statusChangeReceived++;
-            break;
-        }
+        handleEvent(JSON.parse(data.toString()));
       } catch (e) {
-        // JSON parse hatası — yoksay
+        // JSON parse hatası
       }
     });
 
@@ -225,6 +234,7 @@ function printReport(elapsed) {
   console.log(`\n  📨 Mesajlar:`);
   console.log(`     Gönderilen:         ${stats.messagesSent}`);
   console.log(`     Alınan (toplam):    ${stats.messagesReceived}`);
+  console.log(`     ├─ batch mesaj:     ${stats.batchMessagesReceived}  (${stats.eventsInBatches} event)`);
   console.log(`     ├─ presence:        ${stats.presenceReceived}`);
   console.log(`     ├─ channel_join:    ${stats.joinReceived}`);
   console.log(`     ├─ channel_leave:   ${stats.leaveReceived}`);
